@@ -42,9 +42,12 @@ export async function deleteNoteApi(
   return { ok: res.ok, data }
 }
 
-// toB64: correctly unwraps typed arrays to their underlying ArrayBuffer
-export const toB64 = (buf: ArrayBuffer | Uint8Array): string =>
-  btoa(String.fromCharCode(...new Uint8Array(buf instanceof ArrayBuffer ? buf : buf.buffer)))
+// toB64: unwrap typed array to ArrayBuffer first, then use Array.from
+// (spread of Uint8Array fails TS strict downlevel iteration checks)
+export const toB64 = (buf: ArrayBuffer | Uint8Array): string => {
+  const bytes = new Uint8Array(buf instanceof ArrayBuffer ? buf : buf.buffer)
+  return btoa(String.fromCharCode.apply(null, Array.from(bytes)))
+}
 
 export const fromB64 = (s: string): Uint8Array =>
   Uint8Array.from(atob(s), c => c.charCodeAt(0))
