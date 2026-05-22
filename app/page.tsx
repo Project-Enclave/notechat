@@ -1,22 +1,10 @@
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
-
-type Message = { id: string; username: string; content: string; created_at: string }
-type Note = {
-  id: string
-  title: string
-  content: string
-  updated_at: string
-  is_protected: boolean
-  author?: string
-  encrypted_content?: string
-  salt?: string
-  iv?: string
-  encrypted_decoy?: string
-  duress_salt?: string
-  duress_iv?: string
-}
+import { fetchMessages, postMessage, type Message } from '@/lib/chat'
+import {
+  fetchNotes, saveNoteApi, deleteNoteApi, encryptNote, decryptNote, type Note
+} from '@/lib/notes'
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|avif)(\?.*)?$/i
 const URL_RE = /https?:\/\/[^\s]+/g
@@ -76,41 +64,24 @@ function renderNoteContent(text: string) {
   })
 }
 
-async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
-  const enc = new TextEncoder()
-  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey'])
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: salt as unknown as Uint8Array<ArrayBuffer>, iterations: 200000, hash: 'SHA-256' },
-    keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
-  )
-}
-
-async function encrypt(text: string, password: string): Promise<{ ciphertext: string; salt: string; iv: string }> {
-  const salt = crypto.getRandomValues(new Uint8Array(16))
-  const iv = crypto.getRandomValues(new Uint8Array(12))
-  const key = await deriveKey(password, salt)
-  const enc = new TextEncoder()
-  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(text))
-  const toB64 = (buf: ArrayBuffer | Uint8Array) => btoa(String.fromCharCode(...Array.from(new Uint8Array(buf instanceof ArrayBuffer ? buf : buf))))
-  return { ciphertext: toB64(encrypted), salt: toB64(salt), iv: toB64(iv) }
-}
-
-async function decrypt(ciphertext: string, password: string, saltB64: string, ivB64: string): Promise<string | null> {
-  try {
-    const fromB64 = (s: string) => Uint8Array.from(atob(s), c => c.charCodeAt(0))
-    const key = await deriveKey(password, fromB64(saltB64))
-    const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(ivB64) }, key, fromB64(ciphertext))
-    return new TextDecoder().decode(decrypted)
-  } catch { return null }
-}
-
+// ─── Duress ──────────────────────────────────────────────────────────────────
+// Spawns one Worker per CPU core to pressure the attacker's session.
+// Workers are auto-stopped after 30s and their blob URLs revoked to prevent
+// memory leaks on repeated triggers.
 function triggerDuress() {
   const workerCode = `self.onmessage=function(){const a=[];while(true){for(let i=0;i<1e7;i++)a.push(Math.random()*Math.random());if(a.length>5e7)a.splice(0,1e7);}}`
-  const url = URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' }))
   const cores = navigator.hardwareConcurrency || 4
-  for (let i = 0; i < cores; i++) { const w = new Worker(url); w.postMessage('go') }
-  // Cap main-thread fill at 2M to pressure GC without OOM-crashing the tab.
-  // Auto-stop after 30s — fingerprinting is done by then.
+  const workerUrls: string[] = []
+  const workers: Worker[] = []
+
+  for (let i = 0; i < cores; i++) {
+    const url = URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' }))
+    workerUrls.push(url)
+    const w = new Worker(url)
+    w.postMessage('go')
+    workers.push(w)
+  }
+
   const g: number[] = []
   let running = true
   const fill = () => {
@@ -119,7 +90,26 @@ function triggerDuress() {
     requestAnimationFrame(fill)
   }
   fill()
-  setTimeout(() => { running = false; g.length = 0 }, 30_000)
+
+  setTimeout(() => {
+    running = false
+    g.length = 0
+    workers.forEach(w => w.terminate())
+    workerUrls.forEach(u => URL.revokeObjectURL(u)) // fix: revoke blob URLs to prevent memory leak
+  }, 30_000)
+}
+
+// ─── Duress session persistence ───────────────────────────────────────────────
+// pendingDuress is stored in sessionStorage so it survives a page refresh.
+// Key is namespaced by noteId to avoid cross-note collisions.
+function getDuressFlag(noteId: string): boolean {
+  try { return sessionStorage.getItem(`duress_${noteId}`) === '1' } catch { return false }
+}
+function setDuressFlag(noteId: string, val: boolean) {
+  try {
+    if (val) sessionStorage.setItem(`duress_${noteId}`, '1')
+    else sessionStorage.removeItem(`duress_${noteId}`)
+  } catch { /* sessionStorage blocked */ }
 }
 
 export default function Home() {
@@ -133,7 +123,6 @@ export default function Home() {
     }
   }, [])
 
-  // note signing
   const [editUser, setEditUser] = useState<string>('')
   const [showUserEdit, setShowUserEdit] = useState(false)
   const [userEditInput, setUserEditInput] = useState('')
@@ -148,7 +137,6 @@ export default function Home() {
     setShowUserEdit(false)
   }
 
-  // session id — generated once on mount, stable for the whole session, resets on refresh
   const [sessionId, setSessionId] = useState('')
   useEffect(() => { setSessionId(randomSessionId()) }, [])
 
@@ -159,8 +147,8 @@ export default function Home() {
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
-  // Ref to the poll interval so we can pause it during send
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
   const [notes, setNotes] = useState<Note[]>([])
   const [activeNote, setActiveNote] = useState<Note | null>(null)
   const [noteTitle, setNoteTitle] = useState('')
@@ -179,9 +167,14 @@ export default function Home() {
   const [noteViewMode, setNoteViewMode] = useState<'edit' | 'preview'>('preview')
   const [noteError, setNoteError] = useState('')
 
+  // Restore pendingDuress from sessionStorage on mount / note change
+  useEffect(() => {
+    if (activeNote) setPendingDuress(getDuressFlag(activeNote.id))
+  }, [activeNote?.id])
+
   useEffect(() => {
     if (tab !== 'chat') return
-    const load = () => fetch('/api/messages').then(r => r.json()).then(d => { if (Array.isArray(d)) setMessages(d) })
+    const load = () => fetchMessages().then(setMessages)
     load()
     pollRef.current = setInterval(load, 3000)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
@@ -191,38 +184,29 @@ export default function Home() {
 
   useEffect(() => {
     if (tab !== 'notes') return
-    fetch('/api/notes').then(r => r.json()).then(d => { if (Array.isArray(d)) setNotes(d) })
+    fetchNotes().then(setNotes)
   }, [tab])
 
   async function sendMessage(e: React.FormEvent) {
     e.preventDefault()
     if (!msgInput.trim() || sending) return
     const effectiveName = username.trim() || sessionId
-    // Optimistic insert
     const optimisticId = 'opt-' + Date.now()
     const optimistic: Message = { id: optimisticId, username: effectiveName, content: msgInput, created_at: new Date().toISOString() }
     setMessages(m => [...m, optimistic])
     setMsgInput('')
     setSendError('')
     setSending(true)
-    // Pause poll while request is in-flight to avoid duplicate flicker
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
-    const res = await fetch('/api/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: effectiveName, content: optimistic.content }),
-    })
-    const data = await res.json()
-    if (!res.ok) {
+    const { ok, data } = await postMessage(effectiveName, optimistic.content)
+    if (!ok) {
       if (data.dos) triggerDuress()
-      setMessages(m => m.filter(x => x.id !== optimisticId)) // rollback
-      setSendError(data.error || 'failed to send')
+      setMessages(m => m.filter(x => x.id !== optimisticId))
+      setSendError((data.error as string) || 'failed to send')
     } else {
-      const d = await fetch('/api/messages').then(r => r.json())
-      if (Array.isArray(d)) setMessages(d)
+      await fetchMessages().then(setMessages)
     }
-    // Resume poll
-    const load = () => fetch('/api/messages').then(r => r.json()).then(d => { if (Array.isArray(d)) setMessages(d) })
+    const load = () => fetchMessages().then(setMessages)
     pollRef.current = setInterval(load, 3000)
     setSending(false)
   }
@@ -233,10 +217,10 @@ export default function Home() {
     setSavingNote(true)
     let body: Record<string, unknown> = { title: noteTitle, content: noteContent }
     if (isProtecting && notePassword.trim()) {
-      const real = await encrypt(noteContent, notePassword)
+      const real = await encryptNote(noteContent, notePassword)
       let decoyData = null
       if (noteDuressPassword.trim() && noteDecoyContent.trim()) {
-        decoyData = await encrypt(noteDecoyContent, noteDuressPassword)
+        decoyData = await encryptNote(noteDecoyContent, noteDuressPassword)
       }
       body = {
         title: noteTitle, content: '', is_protected: true,
@@ -244,25 +228,22 @@ export default function Home() {
         ...(decoyData ? { encrypted_decoy: decoyData.ciphertext, duress_salt: decoyData.salt, duress_iv: decoyData.iv } : {}),
       }
     }
-    const url = activeNote ? `/api/notes/${activeNote.id}` : '/api/notes'
-    const method = activeNote ? 'PATCH' : 'POST'
-    const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-    const d = await res.json()
-    if (!res.ok) {
-      if (d.dos) triggerDuress()
-      setNoteError(d.error || 'failed to save')
+    const { ok, data } = await saveNoteApi(body, activeNote?.id)
+    if (!ok) {
+      if (data.dos) triggerDuress()
+      setNoteError((data.error as string) || 'failed to save')
       setSavingNote(false); return
     }
-    if (activeNote) { setNotes(n => n.map(x => x.id === d.id ? d : x)); setActiveNote(d) }
-    else { setNotes(n => [d, ...n]); setActiveNote(d) }
+    const saved = data as unknown as Note
+    if (activeNote) { setNotes(n => n.map(x => x.id === saved.id ? saved : x)); setActiveNote(saved) }
+    else { setNotes(n => [saved, ...n]); setActiveNote(saved) }
     setIsProtecting(false); setNotePassword(''); setNoteDuressPassword(''); setNoteDecoyContent('')
     setSavingNote(false)
   }
 
   async function deleteNote(id: string) {
-    const res = await fetch(`/api/notes/${id}`, { method: 'DELETE' })
-    const d = await res.json()
-    if (!res.ok) { if (d.dos) triggerDuress(); return }
+    const { ok, data } = await deleteNoteApi(id)
+    if (!ok) { if (data.dos) triggerDuress(); return }
     setNotes(n => n.filter(x => x.id !== id))
     if (activeNote?.id === id) resetNoteEditor()
   }
@@ -277,7 +258,9 @@ export default function Home() {
 
   function openNote(note: Note) {
     setActiveNote(note); setNoteTitle(note.title)
-    setUnlockPhase('locked'); setUnlockPw(''); setUnlockError(''); setPendingDuress(false)
+    setUnlockPhase('locked'); setUnlockPw(''); setUnlockError('')
+    // Restore duress flag from sessionStorage
+    setPendingDuress(getDuressFlag(note.id))
     setNoteViewMode('preview'); setNoteError('')
     if (!note.is_protected) setNoteContent(note.content)
     else { setNoteContent(''); setDecryptedContent('') }
@@ -286,11 +269,23 @@ export default function Home() {
   async function handleDecrypt() {
     if (!activeNote || !unlockPw.trim()) return
     setUnlockError('')
-    const real = await decrypt(activeNote.encrypted_content!, unlockPw, activeNote.salt!, activeNote.iv!)
-    if (real !== null) { setDecryptedContent(real); setUnlockPhase('decrypted'); setPendingDuress(false); return }
+    const real = await decryptNote(activeNote.encrypted_content!, unlockPw, activeNote.salt!, activeNote.iv!)
+    if (real !== null) {
+      setDecryptedContent(real); setUnlockPhase('decrypted')
+      setPendingDuress(false)
+      setDuressFlag(activeNote.id, false)
+      return
+    }
     if (activeNote.encrypted_decoy && activeNote.duress_salt && activeNote.duress_iv) {
-      const decoy = await decrypt(activeNote.encrypted_decoy, unlockPw, activeNote.duress_salt, activeNote.duress_iv)
-      if (decoy !== null) { window.open(window.location.href, '_blank'); setPendingDuress(true); setDecryptedContent(decoy); setUnlockPhase('decrypted'); return }
+      const decoy = await decryptNote(activeNote.encrypted_decoy, unlockPw, activeNote.duress_salt, activeNote.duress_iv)
+      if (decoy !== null) {
+        window.open(window.location.href, '_blank')
+        setPendingDuress(true)
+        setDuressFlag(activeNote.id, true) // persist across refresh
+        setDecryptedContent(decoy)
+        setUnlockPhase('decrypted')
+        return
+      }
     }
     setUnlockError('wrong password')
   }
