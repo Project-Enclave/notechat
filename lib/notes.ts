@@ -49,16 +49,20 @@ export const toB64 = (buf: ArrayBuffer | Uint8Array): string => {
   return btoa(String.fromCharCode.apply(null, Array.from(bytes)))
 }
 
-export const fromB64 = (s: string): Uint8Array =>
-  Uint8Array.from(atob(s), c => c.charCodeAt(0))
+// fromB64: wrap in a second Uint8Array constructor so the backing buffer
+// is a plain ArrayBuffer (not ArrayBufferLike), satisfying Web Crypto types.
+export const fromB64 = (s: string): Uint8Array<ArrayBuffer> => {
+  const raw = Uint8Array.from(atob(s), c => c.charCodeAt(0))
+  return new Uint8Array(raw.buffer.slice(0)) as Uint8Array<ArrayBuffer>
+}
 
-export async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
+export async function deriveKey(password: string, salt: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
   const enc = new TextEncoder()
   const keyMaterial = await crypto.subtle.importKey(
     'raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']
   )
   return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: salt.buffer as ArrayBuffer, iterations: 200_000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt, iterations: 200_000, hash: 'SHA-256' },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
     false,
@@ -70,8 +74,8 @@ export async function encryptNote(
   text: string,
   password: string
 ): Promise<{ ciphertext: string; salt: string; iv: string }> {
-  const salt = crypto.getRandomValues(new Uint8Array(16))
-  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const salt = crypto.getRandomValues(new Uint8Array(16)) as Uint8Array<ArrayBuffer>
+  const iv = crypto.getRandomValues(new Uint8Array(12)) as Uint8Array<ArrayBuffer>
   const key = await deriveKey(password, salt)
   const encrypted = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
