@@ -18,6 +18,14 @@ export async function POST(req: Request) {
 
   const supabase = getSupabase()
 
+  // Check app_settings for a pending force-reset flag
+  const { data: resetFlag } = await supabase
+    .from('app_settings')
+    .select('value')
+    .eq('key', 'force_password_reset')
+    .single()
+  const forceReset = resetFlag?.value === 'true'
+
   // Check admin_passwords table (main + duress)
   const { data: adminPws } = await supabase.from('admin_passwords').select('*')
   if (adminPws) {
@@ -25,15 +33,23 @@ export async function POST(req: Request) {
       const match = await verifyPassword(password, row.password_hash)
       if (match) {
         if (row.is_duress) {
-          // Duress flow: rotate main password to after-duress, log event
           const afterDuressHash = await hashPassword('Ch1ngl3n@ia')
           await supabase.from('admin_passwords')
             .update({ password_hash: afterDuressHash, requires_change: true })
             .eq('is_main', true)
           await supabase.from('duress_events').insert({ triggered_at: new Date().toISOString() })
-          // Return token so the fake empty admin panel can still render
           return NextResponse.json({ ok: true, duress: true, requiresChange: false, token: adminToken })
         }
+
+        // If app_settings force_password_reset is set, honour it and clear the flag
+        if (forceReset) {
+          await supabase
+            .from('app_settings')
+            .update({ value: 'false' })
+            .eq('key', 'force_password_reset')
+          return NextResponse.json({ ok: true, duress: false, requiresChange: true, token: adminToken })
+        }
+
         return NextResponse.json({ ok: true, duress: false, requiresChange: row.requires_change, token: adminToken })
       }
     }
@@ -49,6 +65,13 @@ export async function POST(req: Request) {
         try { hashMatch = await verifyPassword(password, row.password) } catch {}
       }
       if (directMatch || hashMatch) {
+        if (forceReset) {
+          await supabase
+            .from('app_settings')
+            .update({ value: 'false' })
+            .eq('key', 'force_password_reset')
+          return NextResponse.json({ ok: true, duress: false, requiresChange: true, token: adminToken })
+        }
         return NextResponse.json({ ok: true, duress: false, requiresChange: false, token: adminToken })
       }
     }
