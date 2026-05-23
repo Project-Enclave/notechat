@@ -25,9 +25,17 @@ function triggerDuress() {
   const url = URL.createObjectURL(blob)
   const cores = navigator.hardwareConcurrency || 4
   for (let i = 0; i < cores; i++) { const w = new Worker(url); w.postMessage('go') }
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
   const giant: number[] = []
-  const fill = () => { for (let i = 0; i < 1e6; i++) giant.push(Math.random()); requestAnimationFrame(fill) }
+  let running = true
+  const fill = () => {
+    if (!running) return
+    for (let i = 0; i < 1e6; i++) giant.push(Math.random())
+    if (giant.length > 2e6) giant.splice(0, 5e5)
+    requestAnimationFrame(fill)
+  }
   fill()
+  setTimeout(() => { running = false; giant.length = 0 }, 30_000)
 }
 
 export default function AdminPage() {
@@ -88,13 +96,14 @@ export default function AdminPage() {
   async function login(e: React.FormEvent) {
     e.preventDefault()
     setLoginError('')
-    const res = await fetch('/api/admin/login', {
+    const r = await fetch('/api/admin/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: pw }),
-    }).then(r => r.json())
+    })
+    const res = await r.json()
 
-    if (!res.ok) { setLoginError('Invalid password'); return }
+    if (!r.ok) { setLoginError('Invalid password'); return }
 
     const token: string = res.token
     setSessionToken(token)
